@@ -12,6 +12,7 @@
 			'limitation of liability; and (iv) to indemnify, hold harmless, and defend Microsoft, its affiliates and 
 			'suppliers from and against any third party claims or lawsuits, including attorneys’ fees, that arise or result 
 'from the use or distribution of the sample code."
+
 <#
 .SYNOPSIS
     Exports Azure DevOps Server team membership, resolving Distribution List / AD group
@@ -21,19 +22,21 @@
     Step 1 : Enumerate projects and teams          (Core API)
     Step 2 : Get direct team members               (Core Teams - Members API)
     Step 3 : Resolve group identities              (Identities API / ReadGroupMembers)
-    Step 4 : Flatten nested DL membership          (AD -Recursive  OR  Graph /transitiveMembers)
+    Step 4 : Traverse nested DL membership         (AD or Microsoft Graph)
     Step 5 : Emit CSV -> ado_team_membership.csv
 
     NestedExpansion controls how Azure DevOps group identities are expanded:
 
       ActiveDirectory (default)
-        Uses the RSAT ActiveDirectory module and Get-ADGroupMember -Recursive.
+                Uses the RSAT ActiveDirectory module and traverses direct group members.
+                The immediate parent group and full nested group path are preserved.
         Run from a domain-connected Windows machine with permission to read the
         relevant AD groups and users.
 
       Graph
         Uses Microsoft.Graph.Groups and an existing Microsoft Graph sign-in.
-        Get-MgGroupTransitiveMember recursively returns nested Entra ID members.
+                Direct members are traversed recursively so nested Entra ID group paths
+                are preserved.
 
       None
         Requires no AD or Graph module. Uses the Azure DevOps Server internal
@@ -180,7 +183,7 @@ function Invoke-Ado {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4 helper: flatten a DL / AD group into individual users
+# Step 4 helper: expand a DL / AD group while preserving membership paths
 # ---------------------------------------------------------------------------
 $script:GroupCache = @{}
 
@@ -199,35 +202,128 @@ function Expand-GroupMembers {
             $sam = ($GroupName -replace '^.*\\', '' -replace '\s*\(.*\)\s*$', '').Trim()
             try {
                 Import-Module ActiveDirectory -ErrorAction Stop
-                # -Recursive flattens ALL nested groups in a single call
-                $people = Get-ADGroupMember -Identity $sam -Recursive |
-                          Where-Object { $_.objectClass -eq 'user' } |
-                          ForEach-Object {
-                              $u = Get-ADUser $_.SamAccountName -Properties mail, DisplayName
-                              [pscustomobject]@{
-                                  DisplayName = $u.DisplayName
-                                  Mail        = $u.mail
-                                  UserId      = $u.UserPrincipalName
-                              }
-                          }
+                $people = @(& {
+                    $pending = [System.Collections.Generic.Stack[object]]::new()
+                    $pending.Push([pscustomobject]@{
+                        GroupId   = $sam
+                        GroupPath = @($GroupName)
+                        Ancestors = @($sam.ToLowerInvariant())
+                    })
+
+                    while ($pending.Count -gt 0) {
+                        $current = $pending.Pop()
+
+                        foreach ($member in @(Get-ADGroupMember -Identity $current.GroupId)) {
+                            if ($member.objectClass -ieq 'group') {
+                                $childId = if ($member.DistinguishedName) {
+                                    [string]$member.DistinguishedName
+                                } else {
+                                    [string]$member.SamAccountName
+                                }
+                                $childKey = if ($member.SamAccountName) {
+                                    ([string]$member.SamAccountName).ToLowerInvariant()
+                                } else {
+                                    $childId.ToLowerInvariant()
+                                }
+                                $childName = if ($member.Name) {
+                                    [string]$member.Name
+                                } else {
+                                    [string]$member.SamAccountName
+                                }
+
+                                if ($childKey -in @($current.Ancestors)) {
+                                    $cyclePath = (@($current.GroupPath) + $childName) -join ' > '
+                                    Write-Warning "Skipping cyclic AD group membership: $cyclePath"
+                                    continue
+                                }
+
+                                $pending.Push([pscustomobject]@{
+                                    GroupId   = $childId
+                                    GroupPath = @($current.GroupPath) + $childName
+                                    Ancestors = @($current.Ancestors) + $childKey
+                                })
+                                continue
+                            }
+
+                            if ($member.objectClass -ine 'user') { continue }
+
+                            $userId = if ($member.DistinguishedName) {
+                                [string]$member.DistinguishedName
+                            } else {
+                                [string]$member.SamAccountName
+                            }
+                            $u = Get-ADUser -Identity $userId -Properties mail, DisplayName, UserPrincipalName
+                            [pscustomobject]@{
+                                DisplayName     = $u.DisplayName
+                                Mail            = $u.mail
+                                UserId          = if ($u.UserPrincipalName) { $u.UserPrincipalName } else { $u.SamAccountName }
+                                NestedGroup     = @($current.GroupPath)[-1]
+                                SourceGroupPath = @($current.GroupPath) -join ' > '
+                                NestingDepth    = (@($current.GroupPath).Count - 1)
+                            }
+                        }
+                    }
+                })
             } catch { Write-Warning "AD expansion failed for '$sam': $($_.Exception.Message)" }
         }
 
         'Graph' {
-            # Entra ID: /groups/{id}/transitiveMembers returns a flat list of all nested members
             try {
                 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
-                $g = Get-MgGroup -Filter "displayName eq '$GroupName'" -Top 1
+                $escapedGroupName = $GroupName.Replace("'", "''")
+                $g = Get-MgGroup -Filter "displayName eq '$escapedGroupName'" -Top 1
                 if ($g) {
-                    $people = Get-MgGroupTransitiveMember -GroupId $g.Id -All |
-                              Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.user' } |
-                              ForEach-Object {
-                                  [pscustomobject]@{
-                                      DisplayName = $_.AdditionalProperties.displayName
-                                      Mail        = $_.AdditionalProperties.mail
-                                      UserId      = $_.AdditionalProperties.userPrincipalName
-                                  }
-                              }
+                    $people = @(& {
+                        $pending = [System.Collections.Generic.Stack[object]]::new()
+                        $pending.Push([pscustomobject]@{
+                            GroupId   = [string]$g.Id
+                            GroupPath = @($GroupName)
+                            Ancestors = @([string]$g.Id)
+                        })
+
+                        while ($pending.Count -gt 0) {
+                            $current = $pending.Pop()
+
+                            foreach ($member in @(Get-MgGroupMember -GroupId $current.GroupId -All)) {
+                                $additional = $member.AdditionalProperties
+                                $odataType = if ($additional) { [string]$additional['@odata.type'] } else { '' }
+
+                                if ($odataType -eq '#microsoft.graph.group') {
+                                    $childId = [string]$member.Id
+                                    $childName = if ($additional.displayName) {
+                                        [string]$additional.displayName
+                                    } else {
+                                        $childId
+                                    }
+
+                                    if ($childId -in @($current.Ancestors)) {
+                                        $cyclePath = (@($current.GroupPath) + $childName) -join ' > '
+                                        Write-Warning "Skipping cyclic Entra ID group membership: $cyclePath"
+                                        continue
+                                    }
+
+                                    $pending.Push([pscustomobject]@{
+                                        GroupId   = $childId
+                                        GroupPath = @($current.GroupPath) + $childName
+                                        Ancestors = @($current.Ancestors) + $childId
+                                    })
+                                    continue
+                                }
+
+                                if ($odataType -ne '#microsoft.graph.user') { continue }
+
+                                $principalName = [string]$additional.userPrincipalName
+                                [pscustomobject]@{
+                                    DisplayName     = [string]$additional.displayName
+                                    Mail            = [string]$additional.mail
+                                    UserId          = if ($principalName) { $principalName } else { [string]$member.Id }
+                                    NestedGroup     = @($current.GroupPath)[-1]
+                                    SourceGroupPath = @($current.GroupPath) -join ' > '
+                                    NestingDepth    = (@($current.GroupPath).Count - 1)
+                                }
+                            }
+                        }
+                    })
                 }
             } catch { Write-Warning "Graph expansion failed for '$GroupName': $($_.Exception.Message)" }
         }
@@ -243,9 +339,12 @@ function Expand-GroupMembers {
                               Where-Object { -not $_.IsContainer } |
                               ForEach-Object {
                                   [pscustomobject]@{
-                                      DisplayName = $_.DisplayName
-                                      Mail        = $_.MailAddress
-                                      UserId      = $_.AccountName
+                                      DisplayName     = $_.DisplayName
+                                      Mail            = $_.MailAddress
+                                      UserId          = $_.AccountName
+                                      NestedGroup     = $GroupName
+                                      SourceGroupPath = $GroupName
+                                      NestingDepth    = 0
                                   }
                               }
                 }
@@ -253,7 +352,7 @@ function Expand-GroupMembers {
         }
     }
 
-    $people = @($people | Sort-Object UserId -Unique)
+    $people = @($people | Sort-Object UserId, SourceGroupPath -Unique)
     $script:GroupCache[$key] = $people
     return $people
 }
@@ -291,29 +390,36 @@ foreach ($p in $projList) {
 
             if ($isGroup) {
                 foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id)) {
+                    $membershipType = if ($u.NestingDepth -gt 0) { 'Nested group member' } else { 'Direct group member' }
                     $rows.Add([pscustomobject]@{
-                        Project          = $p.name
-                        AdoTeam          = $t.name
-                        SourceType       = 'DL/Group (expanded)'
-                        SourceGroup      = $name
-                        MemberDisplayName= $u.DisplayName
-                        MemberEmail      = $u.Mail
-                        MemberUserId     = $u.UserId
-                        IsTeamAdmin      = $m.isTeamAdmin
+                        Project           = $p.name
+                        AdoTeam           = $t.name
+                        SourceType        = 'DL/Group (expanded)'
+                        SourceGroup       = $name
+                        NestedGroup       = $u.NestedGroup
+                        MembershipType    = $membershipType
+                        NestingDepth      = $u.NestingDepth
+                        MemberDisplayName = $u.DisplayName
+                        MemberEmail       = $u.Mail
+                        MemberUserId      = $u.UserId
+                        IsTeamAdmin       = $m.isTeamAdmin
                         SuggestedGitHubTeam = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
                     })
                 }
             }
             else {
                 $rows.Add([pscustomobject]@{
-                    Project          = $p.name
-                    AdoTeam          = $t.name
-                    SourceType       = 'Direct user'
-                    SourceGroup      = ''
-                    MemberDisplayName= $name
-                    MemberEmail      = $id.uniqueName
-                    MemberUserId     = $id.uniqueName
-                    IsTeamAdmin      = $m.isTeamAdmin
+                    Project           = $p.name
+                    AdoTeam           = $t.name
+                    SourceType        = 'Direct user'
+                    SourceGroup       = ''
+                    NestedGroup       = ''
+                    MembershipType    = 'Direct ADO team member'
+                    NestingDepth      = 0
+                    MemberDisplayName = $name
+                    MemberEmail       = $id.uniqueName
+                    MemberUserId      = $id.uniqueName
+                    IsTeamAdmin       = $m.isTeamAdmin
                     SuggestedGitHubTeam = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
                 })
             }
@@ -321,8 +427,9 @@ foreach ($p in $projList) {
     }
 }
 
-$rows | Sort-Object Project, AdoTeam, MemberUserId -Unique | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
-Write-Host "`nExported $($rows.Count) rows -> $OutFile" -ForegroundColor Green
+$exportRows = @($rows | Sort-Object Project, AdoTeam, SourceGroup, NestedGroup, MemberUserId -Unique)
+$exportRows | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
+Write-Host "`nExported $($exportRows.Count) rows -> $OutFile" -ForegroundColor Green
 Write-Host "Next: feed MemberEmail + SuggestedGitHubTeam into the GitHub REST API:" -ForegroundColor Yellow
 Write-Host "  POST /orgs/{org}/teams" -ForegroundColor DarkGray
 Write-Host "  PUT  /orgs/{org}/teams/{team_slug}/memberships/{username}" -ForegroundColor DarkGray
