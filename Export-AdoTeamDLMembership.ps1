@@ -11,7 +11,7 @@
 			'a disclaimer of warranties, exclusion of liability for indirect and consequential damages and a reasonable 
 			'limitation of liability; and (iv) to indemnify, hold harmless, and defend Microsoft, its affiliates and 
 			'suppliers from and against any third party claims or lawsuits, including attorneys’ fees, that arise or result 
-'from the use or distribution of the sample code."
+'from the use or distribution of the sample code.
 
 <#
 .SYNOPSIS
@@ -22,26 +22,34 @@
     Step 1 : Enumerate projects and teams          (Core API)
     Step 2 : Get direct team members               (Core Teams - Members API)
     Step 3 : Resolve group identities              (Identities API / ReadGroupMembers)
-    Step 4 : Traverse nested DL membership         (AD or Microsoft Graph)
+    Step 4 : Traverse nested DL membership         (Azure DevOps, AD, or Graph)
     Step 5 : Emit CSV -> ado_team_membership.csv
 
     NestedExpansion controls how Azure DevOps group identities are expanded:
 
-      ActiveDirectory (default)
-                Uses the RSAT ActiveDirectory module and traverses direct group members.
-                The immediate parent group and full nested group path are preserved.
+      AdoApi (default)
+        Requires no extra module and no domain connectivity - only the PAT.
+        Walks the Azure DevOps Identities API recursively, so nested Azure
+        DevOps groups, AD groups, and teams are all expanded with their parent
+        group preserved. Reflects membership as Azure DevOps sees it.
+
+      ActiveDirectory
+        Uses the RSAT ActiveDirectory module and traverses direct group members.
         Run from a domain-connected Windows machine with permission to read the
-        relevant AD groups and users.
+        relevant AD groups and users. Azure DevOps-internal groups (project and
+        team groups) do not exist in AD and are always expanded through AdoApi.
 
       Graph
         Uses Microsoft.Graph.Groups and an existing Microsoft Graph sign-in.
-                Direct members are traversed recursively so nested Entra ID group paths
-                are preserved.
+        Direct members are traversed recursively so nested Entra ID group paths
+        are preserved.
 
       None
-        Requires no AD or Graph module. Uses the Azure DevOps Server internal
-        ReadGroupMembers endpoint and returns direct group members only. Nested
-        groups are not expanded. This is the recommended mode for a first test.
+        Uses the Azure DevOps Server internal ReadGroupMembers endpoint and
+        returns direct group members only. Nested groups are not expanded.
+
+    If the module required by ActiveDirectory or Graph cannot be loaded, the
+    script warns once and falls back to AdoApi instead of failing every group.
 
     The script only reads Azure DevOps, AD, or Graph data and writes a CSV. It
     does not create GitHub teams or add GitHub users.
@@ -61,8 +69,8 @@
     -Projects 'Payments','Shared Services'
 
 .PARAMETER NestedExpansion
-    Group expansion provider: ActiveDirectory, Graph, or None. The default is
-    ActiveDirectory.
+    Group expansion provider: AdoApi, ActiveDirectory, Graph, or None. The
+    default is AdoApi, which needs no additional module.
 
 .PARAMETER OutFile
     Destination CSV path. A relative path is resolved from the current working
@@ -164,8 +172,8 @@ param(
     [Parameter(Mandatory)] [string] $CollectionUrl,          # e.g. https://devops.cognizant.com/DefaultCollection
     [Parameter(Mandatory)] [string] $Pat,
     [string[]] $Projects,                                     # optional filter; omit for all
-    [ValidateSet('ActiveDirectory','Graph','None')]
-    [string] $NestedExpansion = 'ActiveDirectory',
+    [ValidateSet('AdoApi','ActiveDirectory','Graph','None')]
+    [string] $NestedExpansion = 'AdoApi',
     [string] $OutFile = './ado_team_membership.csv'
 )
 
@@ -183,25 +191,177 @@ function Invoke-Ado {
 }
 
 # ---------------------------------------------------------------------------
+# Identity helpers - on-prem returns properties as { "Name": { "$value": ... } }
+# ---------------------------------------------------------------------------
+function Get-AdoIdentityProperty {
+    param($Identity, [string]$Name)
+    $value = $Identity.properties.$Name
+    if ($null -eq $value)    { return $null }
+    if ($value -is [string]) { return $value }
+    return [string]$value.'$value'
+}
+
+function Get-AdoIdentityName {
+    param($Identity)
+    foreach ($candidate in @(
+        $Identity.providerDisplayName
+        $Identity.customDisplayName
+        (Get-AdoIdentityProperty $Identity 'Account')
+        $Identity.id)) {
+        if ($candidate) { return [string]$candidate }
+    }
+    return '(unknown identity)'
+}
+
+function Test-AdoIdentityIsContainer {
+    param($Identity)
+    if ($Identity.isContainer -eq $true) { return $true }
+    return ((Get-AdoIdentityProperty $Identity 'SchemaClassName') -eq 'Group')
+}
+
+# ---------------------------------------------------------------------------
+# Preflight: validate the expansion provider once, not once per group
+# ---------------------------------------------------------------------------
+$script:ProviderReady = $true
+$script:ExpansionFailures = 0
+
+switch ($NestedExpansion) {
+    'ActiveDirectory' {
+        try { Import-Module ActiveDirectory -ErrorAction Stop }
+        catch {
+            $script:ProviderReady = $false
+            Write-Warning "ActiveDirectory module could not be loaded: $($_.Exception.Message)"
+            Write-Warning "Install RSAT from an elevated session: Add-WindowsCapability -Online -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'"
+            Write-Warning 'Falling back to -NestedExpansion AdoApi for this run (no extra module required).'
+        }
+    }
+    'Graph' {
+        try { Import-Module Microsoft.Graph.Groups -ErrorAction Stop }
+        catch {
+            $script:ProviderReady = $false
+            Write-Warning "Microsoft.Graph.Groups module could not be loaded: $($_.Exception.Message)"
+            Write-Warning 'Install it with: Install-Module Microsoft.Graph.Groups -Scope CurrentUser'
+            Write-Warning 'Falling back to -NestedExpansion AdoApi for this run (no extra module required).'
+        }
+    }
+}
+
+function Resolve-ExpansionProvider {
+    param($Identity)
+    if ($NestedExpansion -eq 'None') { return 'None' }
+    # Azure DevOps-internal groups (TFS SID S-1-9-*) have no AD or Entra ID counterpart.
+    if ([string]$Identity.descriptor -match 'S-1-9-') { return 'AdoApi' }
+    if ($NestedExpansion -in @('ActiveDirectory','Graph') -and -not $script:ProviderReady) { return 'AdoApi' }
+    return $NestedExpansion
+}
+
+# ---------------------------------------------------------------------------
 # Step 4 helper: expand a DL / AD group while preserving membership paths
 # ---------------------------------------------------------------------------
 $script:GroupCache = @{}
 
-function Expand-GroupMembers {
-    param([string]$GroupName, [string]$GroupIdentityId)
+# IIS caps query strings at 2048 bytes by default, so batch by encoded length.
+function Get-AdoIdentityBatch {
+    param([string[]]$Values, [int]$MaxQueryLength = 1400)
 
-    $key = "$GroupName|$GroupIdentityId"
+    $batches = [System.Collections.Generic.List[object]]::new()
+    $current = [System.Collections.Generic.List[string]]::new()
+    $length  = 0
+
+    foreach ($value in $Values) {
+        $encoded = [uri]::EscapeDataString([string]$value)
+        if ($current.Count -and (($length + $encoded.Length + 3) -gt $MaxQueryLength)) {
+            $batches.Add($current.ToArray())
+            $current = [System.Collections.Generic.List[string]]::new()
+            $length  = 0
+        }
+        $current.Add($encoded)
+        $length += $encoded.Length + 3
+    }
+    if ($current.Count) { $batches.Add($current.ToArray()) }
+
+    return $batches
+}
+
+function Expand-AdoGroupIdentity {
+    param([string]$RootId, [string]$RootName)
+
+    if (-not $RootId) { return @() }
+
+    $emitted = [System.Collections.Generic.List[object]]::new()
+    $pending = [System.Collections.Generic.Stack[object]]::new()
+    $pending.Push([pscustomobject]@{ Id = $RootId; GroupPath = @($RootName); Ancestors = @($RootId) })
+
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+
+        $group = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$($current.Id)&queryMembership=Direct&api-version=$ApiVersion").value |
+                 Select-Object -First 1
+
+        # Azure DevOps Server returns both; GUIDs keep the query string far shorter than descriptors.
+        $lookupParam = 'identityIds'
+        $lookupValues = @($group.memberIds | Where-Object { $_ })
+        if (-not $lookupValues.Count) {
+            $lookupParam  = 'descriptors'
+            $lookupValues = @($group.members | Where-Object { $_ })
+        }
+        if (-not $lookupValues.Count) { continue }
+
+        foreach ($batch in (Get-AdoIdentityBatch -Values $lookupValues)) {
+            $resolved = @((Invoke-Ado "$CollectionUrl/_apis/identities?$lookupParam=$($batch -join ',')&api-version=$ApiVersion").value)
+
+            foreach ($member in $resolved) {
+                $memberName = Get-AdoIdentityName $member
+
+                if (Test-AdoIdentityIsContainer $member) {
+                    $childId = [string]$member.id
+                    if (-not $childId -or ($childId -in @($current.Ancestors))) {
+                        Write-Warning "Skipping cyclic or unresolvable group membership: $((@($current.GroupPath) + $memberName) -join ' > ')"
+                        continue
+                    }
+                    $pending.Push([pscustomobject]@{
+                        Id        = $childId
+                        GroupPath = @($current.GroupPath) + $memberName
+                        Ancestors = @($current.Ancestors) + $childId
+                    })
+                    continue
+                }
+
+                $mail    = Get-AdoIdentityProperty $member 'Mail'
+                $account = Get-AdoIdentityProperty $member 'Account'
+                $emitted.Add([pscustomobject]@{
+                    DisplayName     = $memberName
+                    Mail            = $mail
+                    UserId          = if ($mail) { $mail } elseif ($account) { $account } else { $memberName }
+                    NestedGroup     = @($current.GroupPath)[-1]
+                    SourceGroupPath = @($current.GroupPath) -join ' > '
+                    NestingDepth    = (@($current.GroupPath).Count - 1)
+                })
+            }
+        }
+    }
+
+    return $emitted.ToArray()
+}
+
+function Expand-GroupMembers {
+    param([string]$GroupName, [string]$GroupIdentityId, [string]$Provider = $NestedExpansion)
+
+    $key = "$Provider|$GroupName|$GroupIdentityId"
     if ($script:GroupCache.ContainsKey($key)) { return $script:GroupCache[$key] }
 
     $people = @()
 
-    switch ($NestedExpansion) {
+    switch ($Provider) {
+
+        'AdoApi' {
+            $people = @(Expand-AdoGroupIdentity -RootId $GroupIdentityId -RootName $GroupName)
+        }
 
         'ActiveDirectory' {
             # Strips the "DOMAIN\" / "(Cognizant)" decoration ADO adds to the display name
             $sam = ($GroupName -replace '^.*\\', '' -replace '\s*\(.*\)\s*$', '').Trim()
             try {
-                Import-Module ActiveDirectory -ErrorAction Stop
                 $people = @(& {
                     $pending = [System.Collections.Generic.Stack[object]]::new()
                     $pending.Push([pscustomobject]@{
@@ -264,12 +424,14 @@ function Expand-GroupMembers {
                         }
                     }
                 })
-            } catch { Write-Warning "AD expansion failed for '$sam': $($_.Exception.Message)" }
+            } catch {
+                $script:ExpansionFailures++
+                Write-Warning "AD expansion failed for '$sam': $($_.Exception.Message)"
+            }
         }
 
         'Graph' {
             try {
-                Import-Module Microsoft.Graph.Groups -ErrorAction Stop
                 $escapedGroupName = $GroupName.Replace("'", "''")
                 $g = Get-MgGroup -Filter "displayName eq '$escapedGroupName'" -Top 1
                 if ($g) {
@@ -325,7 +487,10 @@ function Expand-GroupMembers {
                         }
                     })
                 }
-            } catch { Write-Warning "Graph expansion failed for '$GroupName': $($_.Exception.Message)" }
+            } catch {
+                $script:ExpansionFailures++
+                Write-Warning "Graph expansion failed for '$GroupName': $($_.Exception.Message)"
+            }
         }
 
         'None' {
@@ -383,13 +548,13 @@ foreach ($p in $projList) {
             $ident = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$($id.id)&queryMembership=Expanded&api-version=$ApiVersion").value | Select-Object -First 1
             $isGroup = $false
             if ($ident) {
-                $isGroup = ($ident.properties.SchemaClassName.'$value' -eq 'Group') -or
-                           ($ident.descriptor -match 'GroupScopeType|^Microsoft\.TeamFoundation\.Identity;S-1-5-') -or
-                           ($ident.isContainer -eq $true)
+                $isGroup = (Test-AdoIdentityIsContainer $ident) -or
+                           ($ident.descriptor -match 'GroupScopeType|^Microsoft\.TeamFoundation\.Identity;S-1-[59]-')
             }
 
             if ($isGroup) {
-                foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id)) {
+                $provider = Resolve-ExpansionProvider -Identity $ident
+                foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id -Provider $provider)) {
                     $membershipType = if ($u.NestingDepth -gt 0) { 'Nested group member' } else { 'Direct group member' }
                     $rows.Add([pscustomobject]@{
                         Project           = $p.name
@@ -429,8 +594,14 @@ foreach ($p in $projList) {
 
 $exportRows = @($rows | Sort-Object Project, AdoTeam, SourceGroup, NestedGroup, MemberUserId -Unique)
 $exportRows | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
-Write-Host "`nExported $($exportRows.Count) rows -> $OutFile" -ForegroundColor Green
+
+if ($script:ExpansionFailures -gt 0) {
+    Write-Warning "$($script:ExpansionFailures) group(s) could not be expanded - the CSV is INCOMPLETE. Resolve the warnings above before using it for migration."
+    Write-Host "`nExported $($exportRows.Count) rows -> $OutFile" -ForegroundColor Yellow
+}
+else {
+    Write-Host "`nExported $($exportRows.Count) rows -> $OutFile" -ForegroundColor Green
+}
 Write-Host "Next: feed MemberEmail + SuggestedGitHubTeam into the GitHub REST API:" -ForegroundColor Yellow
 Write-Host "  POST /orgs/{org}/teams" -ForegroundColor DarkGray
 Write-Host "  PUT  /orgs/{org}/teams/{team_slug}/memberships/{username}" -ForegroundColor DarkGray
-
