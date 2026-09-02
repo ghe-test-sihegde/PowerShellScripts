@@ -1,17 +1,17 @@
-'By using the following materials or sample code you agree to be bound by the license terms below 
-			'and the Microsoft Partner Program Agreement the terms of which are incorporated herein by this reference. 
-			'These license terms are an agreement between Microsoft Corporation (or, if applicable based on where you 
-			'are located, one of its affiliates) and you. Any materials (other than sample code) we provide to you 
-			'are for your internal use only. Any sample code is provided for the purpose of illustration only and is 
-			'not intended to be used in a production environment. We grant you a nonexclusive, royalty-free right to 
-			'use and modify the sample code and to reproduce and distribute the object code form of the sample code, 
-			'provided that you agree: (i) to not use Microsoft’s name, logo, or trademarks to market your software product 
-			'in which the sample code is embedded; (ii) to include a valid copyright notice on your software product in 
-			'which the sample code is embedded; (iii) to provide on behalf of and for the benefit of your subcontractors 
-			'a disclaimer of warranties, exclusion of liability for indirect and consequential damages and a reasonable 
-			'limitation of liability; and (iv) to indemnify, hold harmless, and defend Microsoft, its affiliates and 
-			'suppliers from and against any third party claims or lawsuits, including attorneys’ fees, that arise or result 
-'from the use or distribution of the sample code.
+# By using the following materials or sample code you agree to be bound by the license terms below
+# and the Microsoft Partner Program Agreement the terms of which are incorporated herein by this reference.
+# These license terms are an agreement between Microsoft Corporation (or, if applicable based on where you
+# are located, one of its affiliates) and you. Any materials (other than sample code) we provide to you
+# are for your internal use only. Any sample code is provided for the purpose of illustration only and is
+# not intended to be used in a production environment. We grant you a nonexclusive, royalty-free right to
+# use and modify the sample code and to reproduce and distribute the object code form of the sample code,
+# provided that you agree: (i) to not use Microsoft's name, logo, or trademarks to market your software product
+# in which the sample code is embedded; (ii) to include a valid copyright notice on your software product in
+# which the sample code is embedded; (iii) to provide on behalf of and for the benefit of your subcontractors
+# a disclaimer of warranties, exclusion of liability for indirect and consequential damages and a reasonable
+# limitation of liability; and (iv) to indemnify, hold harmless, and defend Microsoft, its affiliates and
+# suppliers from and against any third party claims or lawsuits, including attorneys' fees, that arise or result
+# from the use or distribution of the sample code.
 
 <#
 .SYNOPSIS
@@ -215,8 +215,37 @@ function Get-AdoIdentityName {
 
 function Test-AdoIdentityIsContainer {
     param($Identity)
-    if ($Identity.isContainer -eq $true) { return $true }
-    return ((Get-AdoIdentityProperty $Identity 'SchemaClassName') -eq 'Group')
+    if ($null -eq $Identity) { return $false }
+    if ($null -ne $Identity.isContainer) { return ($Identity.isContainer -eq $true) }
+    $schema = Get-AdoIdentityProperty $Identity 'SchemaClassName'
+    if ($schema) { return ($schema -eq 'Group') }
+    # Only the ADO-internal SID (S-1-9) implies a group; S-1-5-21 covers both AD users and AD groups.
+    return ([string]$Identity.descriptor -match 'GroupScopeType|^Microsoft\.TeamFoundation\.Identity;S-1-9-')
+}
+
+# The same person can surface as an ADO GUID, a mail address, a UPN, or DOMAIN\account,
+# so each form is indexed - including the bare account name - to match across providers.
+function Add-IdentityKey {
+    param([System.Collections.Generic.HashSet[string]]$Set, [object[]]$Values)
+    foreach ($value in $Values) {
+        $text = ([string]$value).Trim()
+        if (-not $text) { continue }
+        [void]$Set.Add($text)
+        if     ($text -match '^[^\\]+\\(.+)$') { [void]$Set.Add($Matches[1]) }
+        elseif ($text -match '^([^@]+)@')       { [void]$Set.Add($Matches[1]) }
+    }
+}
+
+function Test-IdentityKey {
+    param([System.Collections.Generic.HashSet[string]]$Set, [object[]]$Values)
+    foreach ($value in $Values) {
+        $text = ([string]$value).Trim()
+        if (-not $text) { continue }
+        if ($Set.Contains($text)) { return $true }
+        if     ($text -match '^[^\\]+\\(.+)$' -and $Set.Contains($Matches[1])) { return $true }
+        elseif ($text -match '^([^@]+)@'       -and $Set.Contains($Matches[1])) { return $true }
+    }
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -224,6 +253,7 @@ function Test-AdoIdentityIsContainer {
 # ---------------------------------------------------------------------------
 $script:ProviderReady = $true
 $script:ExpansionFailures = 0
+$script:InheritedDirectRows = 0
 
 switch ($NestedExpansion) {
     'ActiveDirectory' {
@@ -333,6 +363,8 @@ function Expand-AdoGroupIdentity {
                     DisplayName     = $memberName
                     Mail            = $mail
                     UserId          = if ($mail) { $mail } elseif ($account) { $account } else { $memberName }
+                    IdentityId      = [string]$member.id
+                    Account         = $account
                     NestedGroup     = @($current.GroupPath)[-1]
                     SourceGroupPath = @($current.GroupPath) -join ' > '
                     NestingDepth    = (@($current.GroupPath).Count - 1)
@@ -417,6 +449,8 @@ function Expand-GroupMembers {
                                 DisplayName     = $u.DisplayName
                                 Mail            = $u.mail
                                 UserId          = if ($u.UserPrincipalName) { $u.UserPrincipalName } else { $u.SamAccountName }
+                                IdentityId      = $null
+                                Account         = [string]$u.SamAccountName
                                 NestedGroup     = @($current.GroupPath)[-1]
                                 SourceGroupPath = @($current.GroupPath) -join ' > '
                                 NestingDepth    = (@($current.GroupPath).Count - 1)
@@ -479,6 +513,8 @@ function Expand-GroupMembers {
                                     DisplayName     = [string]$additional.displayName
                                     Mail            = [string]$additional.mail
                                     UserId          = if ($principalName) { $principalName } else { [string]$member.Id }
+                                    IdentityId      = [string]$member.Id
+                                    Account         = $principalName
                                     NestedGroup     = @($current.GroupPath)[-1]
                                     SourceGroupPath = @($current.GroupPath) -join ' > '
                                     NestingDepth    = (@($current.GroupPath).Count - 1)
@@ -507,6 +543,8 @@ function Expand-GroupMembers {
                                       DisplayName     = $_.DisplayName
                                       Mail            = $_.MailAddress
                                       UserId          = $_.AccountName
+                                      IdentityId      = [string]$_.TeamFoundationId
+                                      Account         = [string]$_.AccountName
                                       NestedGroup     = $GroupName
                                       SourceGroupPath = $GroupName
                                       NestingDepth    = 0
@@ -537,63 +575,94 @@ foreach ($p in $projList) {
     foreach ($t in $teams) {
         Write-Host "  Team: $($t.name)"
 
-        # Direct members only - a DL comes back as ONE group identity, not its people
-        $members = (Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000").value
-        foreach ($m in $members) {
+        $slug = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
 
-            $id   = $m.identity
-            $name = $id.displayName
+        # This endpoint may return a DL as a group identity AND the users inside it.
+        $members = (Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000").value
+
+        $groupEntries = [System.Collections.Generic.List[object]]::new()
+        $userEntries  = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($m in $members) {
+            $id = $m.identity
 
             # Resolve the identity to determine whether it's a container (group/DL) or a user
             $ident = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$($id.id)&queryMembership=Expanded&api-version=$ApiVersion").value | Select-Object -First 1
-            $isGroup = $false
-            if ($ident) {
-                $isGroup = (Test-AdoIdentityIsContainer $ident) -or
-                           ($ident.descriptor -match 'GroupScopeType|^Microsoft\.TeamFoundation\.Identity;S-1-[59]-')
-            }
+            $isGroup = Test-AdoIdentityIsContainer $ident
 
-            if ($isGroup) {
-                $provider = Resolve-ExpansionProvider -Identity $ident
-                foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id -Provider $provider)) {
-                    $membershipType = if ($u.NestingDepth -gt 0) { 'Nested group member' } else { 'Direct group member' }
-                    $rows.Add([pscustomobject]@{
-                        Project           = $p.name
-                        AdoTeam           = $t.name
-                        SourceType        = 'DL/Group (expanded)'
-                        SourceGroup       = $name
-                        NestedGroup       = $u.NestedGroup
-                        MembershipType    = $membershipType
-                        NestingDepth      = $u.NestingDepth
-                        MemberDisplayName = $u.DisplayName
-                        MemberEmail       = $u.Mail
-                        MemberUserId      = $u.UserId
-                        IsTeamAdmin       = $m.isTeamAdmin
-                        SuggestedGitHubTeam = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
-                    })
-                }
-            }
-            else {
+            if ($isGroup) { $groupEntries.Add([pscustomobject]@{ Member = $m; Identity = $ident }) }
+            else          { $userEntries.Add([pscustomobject]@{ Member = $m; Identity = $ident }) }
+        }
+
+        # Groups are expanded first so a user inherited from a DL is not also reported as direct.
+        $inheritedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($entry in $groupEntries) {
+            $m    = $entry.Member
+            $id   = $m.identity
+            $name = $id.displayName
+
+            $provider = Resolve-ExpansionProvider -Identity $entry.Identity
+            foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id -Provider $provider)) {
+                $membershipType = if ($u.NestingDepth -gt 0) { 'Nested group member' } else { 'Direct group member' }
                 $rows.Add([pscustomobject]@{
                     Project           = $p.name
                     AdoTeam           = $t.name
-                    SourceType        = 'Direct user'
-                    SourceGroup       = ''
-                    NestedGroup       = ''
-                    MembershipType    = 'Direct ADO team member'
-                    NestingDepth      = 0
-                    MemberDisplayName = $name
-                    MemberEmail       = $id.uniqueName
-                    MemberUserId      = $id.uniqueName
+                    SourceType        = 'DL/Group (expanded)'
+                    SourceGroup       = $name
+                    NestedGroup       = $u.NestedGroup
+                    MembershipType    = $membershipType
+                    NestingDepth      = $u.NestingDepth
+                    MemberDisplayName = $u.DisplayName
+                    MemberEmail       = $u.Mail
+                    MemberUserId      = $u.UserId
                     IsTeamAdmin       = $m.isTeamAdmin
-                    SuggestedGitHubTeam = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
+                    SuggestedGitHubTeam = $slug
                 })
+                Add-IdentityKey -Set $inheritedKeys -Values @($u.IdentityId, $u.Mail, $u.UserId, $u.Account)
             }
+        }
+
+        foreach ($entry in $userEntries) {
+            $m    = $entry.Member
+            $id   = $m.identity
+            $name = $id.displayName
+
+            $candidateKeys = @(
+                $id.id
+                $id.uniqueName
+                (Get-AdoIdentityProperty $entry.Identity 'Mail')
+                (Get-AdoIdentityProperty $entry.Identity 'Account')
+            )
+            if (Test-IdentityKey -Set $inheritedKeys -Values $candidateKeys) {
+                $script:InheritedDirectRows++
+                continue
+            }
+
+            $rows.Add([pscustomobject]@{
+                Project           = $p.name
+                AdoTeam           = $t.name
+                SourceType        = 'Direct user'
+                SourceGroup       = ''
+                NestedGroup       = ''
+                MembershipType    = 'Direct ADO team member'
+                NestingDepth      = 0
+                MemberDisplayName = $name
+                MemberEmail       = $id.uniqueName
+                MemberUserId      = $id.uniqueName
+                IsTeamAdmin       = $m.isTeamAdmin
+                SuggestedGitHubTeam = $slug
+            })
         }
     }
 }
 
 $exportRows = @($rows | Sort-Object Project, AdoTeam, SourceGroup, NestedGroup, MemberUserId -Unique)
 $exportRows | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
+
+if ($script:InheritedDirectRows -gt 0) {
+    Write-Host "Suppressed $($script:InheritedDirectRows) duplicate row(s) for users who reached a team through a group." -ForegroundColor DarkGray
+}
 
 if ($script:ExpansionFailures -gt 0) {
     Write-Warning "$($script:ExpansionFailures) group(s) could not be expanded - the CSV is INCOMPLETE. Resolve the warnings above before using it for migration."
