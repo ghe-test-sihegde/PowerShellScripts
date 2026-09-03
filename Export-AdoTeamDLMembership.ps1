@@ -178,11 +178,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptVersion = '2026-09-03.1'
 $ApiVersion = '6.0'
 $Headers = @{
     Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
     Accept        = 'application/json'
 }
+
+Write-Host "Export-AdoTeamDLMembership version $ScriptVersion (NestedExpansion: $NestedExpansion)" -ForegroundColor DarkGray
 
 function Invoke-Ado {
     param([string]$Uri)
@@ -577,6 +580,13 @@ foreach ($p in $projList) {
 
         $slug = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
 
+        # A team is itself a group identity, so its Direct membership is the authoritative
+        # list of what was added to the team - anything else arrived through a group.
+        $teamDirectIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $teamIdentity = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$($t.id)&queryMembership=Direct&api-version=$ApiVersion").value |
+                        Select-Object -First 1
+        foreach ($memberId in @($teamIdentity.memberIds | Where-Object { $_ })) { [void]$teamDirectIds.Add([string]$memberId) }
+
         # This endpoint may return a DL as a group identity AND the users inside it.
         $members = (Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000").value
 
@@ -596,6 +606,8 @@ foreach ($p in $projList) {
 
         # Groups are expanded first so a user inherited from a DL is not also reported as direct.
         $inheritedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        Write-Verbose "Team '$($t.name)': $($teamDirectIds.Count) direct identity/identities, $($groupEntries.Count) group(s), $($userEntries.Count) user entry/entries."
 
         foreach ($entry in $groupEntries) {
             $m    = $entry.Member
@@ -619,7 +631,7 @@ foreach ($p in $projList) {
                     IsTeamAdmin       = $m.isTeamAdmin
                     SuggestedGitHubTeam = $slug
                 })
-                Add-IdentityKey -Set $inheritedKeys -Values @($u.IdentityId, $u.Mail, $u.UserId, $u.Account)
+                Add-IdentityKey -Set $inheritedKeys -Values @($u.IdentityId, $u.Mail, $u.UserId, $u.Account, $u.DisplayName)
             }
         }
 
@@ -633,9 +645,19 @@ foreach ($p in $projList) {
                 $id.uniqueName
                 (Get-AdoIdentityProperty $entry.Identity 'Mail')
                 (Get-AdoIdentityProperty $entry.Identity 'Account')
+                $name
             )
-            if (Test-IdentityKey -Set $inheritedKeys -Values $candidateKeys) {
+
+            # Prefer the team's own Direct membership; fall back to key matching only when unavailable.
+            $isDirect = if ($teamDirectIds.Count) {
+                $teamDirectIds.Contains([string]$id.id)
+            } else {
+                -not (Test-IdentityKey -Set $inheritedKeys -Values $candidateKeys)
+            }
+
+            if (-not $isDirect) {
                 $script:InheritedDirectRows++
+                Write-Verbose "  Inherited through a group, not listed as direct: $name <$($id.uniqueName)>"
                 continue
             }
 
