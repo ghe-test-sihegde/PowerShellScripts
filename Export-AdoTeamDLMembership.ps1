@@ -623,6 +623,7 @@ foreach ($p in $projList) {
                     SourceType        = 'DL/Group (expanded)'
                     SourceGroup       = $name
                     NestedGroup       = $u.NestedGroup
+                    SourceGroupPath   = $u.SourceGroupPath
                     MembershipType    = $membershipType
                     NestingDepth      = $u.NestingDepth
                     MemberDisplayName = $u.DisplayName
@@ -667,6 +668,7 @@ foreach ($p in $projList) {
                 SourceType        = 'Direct user'
                 SourceGroup       = ''
                 NestedGroup       = ''
+                SourceGroupPath   = ''
                 MembershipType    = 'Direct ADO team member'
                 NestingDepth      = 0
                 MemberDisplayName = $name
@@ -679,7 +681,7 @@ foreach ($p in $projList) {
     }
 }
 
-$exportRows = @($rows | Sort-Object Project, AdoTeam, SourceGroup, NestedGroup, MemberUserId -Unique)
+$exportRows = @($rows | Sort-Object Project, AdoTeam, SourceGroup, SourceGroupPath, NestedGroup, MemberUserId -Unique)
 $exportRows | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 
 if ($script:InheritedDirectRows -gt 0) {
