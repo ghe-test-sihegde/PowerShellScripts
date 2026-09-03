@@ -54,6 +54,9 @@
     The script only reads Azure DevOps, AD, or Graph data and writes a CSV. It
     does not create GitHub teams or add GitHub users.
 
+    Groups and teams that contain no members are still exported, as a single row
+    with SourceType 'DL/Group (empty)' or 'Team (empty)' and no member details.
+
 .PARAMETER CollectionUrl
     Full Azure DevOps Server collection URL, without a trailing slash. Example:
     https://devops.example.com/DefaultCollection
@@ -179,7 +182,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-09-03.2'
+$ScriptVersion = '2026-09-03.3'
 $ApiVersion = '6.0'
 $Headers = @{
     Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
@@ -363,7 +366,21 @@ function Expand-AdoGroupIdentity {
             $lookupParam  = 'descriptors'
             $lookupValues = @($group.members | Where-Object { $_ })
         }
-        if (-not $lookupValues.Count) { continue }
+        # Record the group itself so empty groups are not silently dropped from the export.
+        if (-not $lookupValues.Count) {
+            $emitted.Add([pscustomobject]@{
+                DisplayName     = ''
+                Mail            = ''
+                UserId          = ''
+                IdentityId      = ''
+                Account         = ''
+                NestedGroup     = @($current.GroupPath)[-1]
+                SourceGroupPath = @($current.GroupPath) -join ' > '
+                NestingDepth    = (@($current.GroupPath).Count - 1)
+                IsEmptyGroup    = $true
+            })
+            continue
+        }
 
         foreach ($batch in (Get-AdoIdentityBatch -Values $lookupValues)) {
             $resolved = @((Invoke-Ado "$CollectionUrl/_apis/identities?$lookupParam=$($batch -join ',')&api-version=$ApiVersion").value)
@@ -604,6 +621,7 @@ foreach ($p in $projList) {
         Write-Host "  Team: $($t.name)"
 
         $slug = ($t.name -replace '[^a-zA-Z0-9]+','-').ToLower().Trim('-')
+        $teamRowStart = $rows.Count
 
         # A team is itself a group identity, so its Direct membership is the authoritative
         # list of what was added to the team - anything else arrived through a group.
@@ -613,7 +631,9 @@ foreach ($p in $projList) {
         }
 
         # This endpoint may return a DL as a group identity AND the users inside it.
-        $members = (Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000").value
+        $membersResponse = Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000"
+        $membersCallFailed = ($null -eq $membersResponse)
+        $members = $membersResponse.value
 
         $groupEntries = [System.Collections.Generic.List[object]]::new()
         $userEntries  = [System.Collections.Generic.List[object]]::new()
@@ -652,7 +672,30 @@ foreach ($p in $projList) {
             $name = $id.displayName
 
             $provider = Resolve-ExpansionProvider -Identity $entry.Identity
-            foreach ($u in (Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id -Provider $provider)) {
+            $failuresBefore = $script:ExpansionFailures
+            $expanded = @(Expand-GroupMembers -GroupName $name -GroupIdentityId $id.id -Provider $provider)
+            $expansionFailed = ($script:ExpansionFailures -gt $failuresBefore)
+
+            foreach ($u in $expanded) {
+                if ($u.IsEmptyGroup) {
+                    $rows.Add([pscustomobject]@{
+                        Project           = $p.name
+                        AdoTeam           = $t.name
+                        SourceType        = 'DL/Group (empty)'
+                        SourceGroup       = $name
+                        NestedGroup       = $u.NestedGroup
+                        SourceGroupPath   = $u.SourceGroupPath
+                        MembershipType    = 'Empty group - no members'
+                        NestingDepth      = $u.NestingDepth
+                        MemberDisplayName = ''
+                        MemberEmail       = ''
+                        MemberUserId      = ''
+                        IsTeamAdmin       = $m.isTeamAdmin
+                        SuggestedGitHubTeam = $slug
+                    })
+                    continue
+                }
+
                 $membershipType = if ($u.NestingDepth -gt 0) { 'Nested group member' } else { 'Direct group member' }
                 $rows.Add([pscustomobject]@{
                     Project           = $p.name
@@ -670,6 +713,25 @@ foreach ($p in $projList) {
                     SuggestedGitHubTeam = $slug
                 })
                 Add-IdentityKey -Set $inheritedKeys -Values @($u.IdentityId, $u.Mail, $u.UserId, $u.Account, $u.DisplayName)
+            }
+
+            # Providers that return nothing at all still need the group represented.
+            if (-not $expanded.Count -and -not $expansionFailed) {
+                $rows.Add([pscustomobject]@{
+                    Project           = $p.name
+                    AdoTeam           = $t.name
+                    SourceType        = 'DL/Group (empty)'
+                    SourceGroup       = $name
+                    NestedGroup       = $name
+                    SourceGroupPath   = $name
+                    MembershipType    = 'Empty group - no members'
+                    NestingDepth      = 0
+                    MemberDisplayName = ''
+                    MemberEmail       = ''
+                    MemberUserId      = ''
+                    IsTeamAdmin       = $m.isTeamAdmin
+                    SuggestedGitHubTeam = $slug
+                })
             }
         }
 
@@ -718,6 +780,24 @@ foreach ($p in $projList) {
                 MemberEmail       = $id.uniqueName
                 MemberUserId      = $id.uniqueName
                 IsTeamAdmin       = $m.isTeamAdmin
+                SuggestedGitHubTeam = $slug
+            })
+        }
+
+        if ($rows.Count -eq $teamRowStart -and -not $membersCallFailed) {
+            $rows.Add([pscustomobject]@{
+                Project           = $p.name
+                AdoTeam           = $t.name
+                SourceType        = 'Team (empty)'
+                SourceGroup       = ''
+                NestedGroup       = ''
+                SourceGroupPath   = ''
+                MembershipType    = 'Empty team - no members'
+                NestingDepth      = 0
+                MemberDisplayName = ''
+                MemberEmail       = ''
+                MemberUserId      = ''
+                IsTeamAdmin       = $false
                 SuggestedGitHubTeam = $slug
             })
         }
