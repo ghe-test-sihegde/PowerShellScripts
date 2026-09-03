@@ -174,11 +174,12 @@ param(
     [string[]] $Projects,                                     # optional filter; omit for all
     [ValidateSet('AdoApi','ActiveDirectory','Graph','None')]
     [string] $NestedExpansion = 'AdoApi',
-    [string] $OutFile = './ado_team_membership.csv'
+    [string] $OutFile = './ado_team_membership.csv',
+    [switch] $Diagnose
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-09-03.1'
+$ScriptVersion = '2026-09-03.2'
 $ApiVersion = '6.0'
 $Headers = @{
     Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
@@ -286,6 +287,30 @@ function Resolve-ExpansionProvider {
     if ([string]$Identity.descriptor -match 'S-1-9-') { return 'AdoApi' }
     if ($NestedExpansion -in @('ActiveDirectory','Graph') -and -not $script:ProviderReady) { return 'AdoApi' }
     return $NestedExpansion
+}
+
+# Every identifier of whatever was added straight to the team. A team is itself a group
+# identity, so this is the same data the web UI shows under "membership: direct".
+function Get-TeamDirectMemberKeys {
+    param([string]$TeamId)
+
+    $keys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not $TeamId) { return $keys }
+
+    $identity = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$TeamId&queryMembership=Direct&api-version=$ApiVersion").value |
+                Select-Object -First 1
+    # On-prem populates memberIds (GUIDs) or members (descriptors) depending on version.
+    foreach ($value in @($identity.memberIds | Where-Object { $_ })) { [void]$keys.Add([string]$value) }
+    foreach ($value in @($identity.members   | Where-Object { $_ })) { [void]$keys.Add([string]$value) }
+    if ($keys.Count) { return $keys }
+
+    $r = Invoke-Ado "$CollectionUrl/_api/_identity/ReadGroupMembers?scope=$TeamId&readMembers=true&api-version=$ApiVersion"
+    foreach ($i in @($r.identities | Where-Object { $_ })) {
+        foreach ($value in @($i.TeamFoundationId, $i.Descriptor, $i.AccountName, $i.MailAddress)) {
+            if ($value) { [void]$keys.Add([string]$value) }
+        }
+    }
+    return $keys
 }
 
 # ---------------------------------------------------------------------------
@@ -582,10 +607,10 @@ foreach ($p in $projList) {
 
         # A team is itself a group identity, so its Direct membership is the authoritative
         # list of what was added to the team - anything else arrived through a group.
-        $teamDirectIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $teamIdentity = (Invoke-Ado "$CollectionUrl/_apis/identities?identityIds=$($t.id)&queryMembership=Direct&api-version=$ApiVersion").value |
-                        Select-Object -First 1
-        foreach ($memberId in @($teamIdentity.memberIds | Where-Object { $_ })) { [void]$teamDirectIds.Add([string]$memberId) }
+        $teamDirectKeys = Get-TeamDirectMemberKeys -TeamId $t.id
+        if (-not $teamDirectKeys.Count) {
+            Write-Warning "Could not read direct membership for team '$($t.name)'. 'Direct user' rows for this team are inferred and may be wrong."
+        }
 
         # This endpoint may return a DL as a group identity AND the users inside it.
         $members = (Invoke-Ado "$CollectionUrl/_apis/projects/$($p.id)/teams/$($t.id)/members?api-version=$ApiVersion&`$top=1000").value
@@ -607,7 +632,19 @@ foreach ($p in $projList) {
         # Groups are expanded first so a user inherited from a DL is not also reported as direct.
         $inheritedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-        Write-Verbose "Team '$($t.name)': $($teamDirectIds.Count) direct identity/identities, $($groupEntries.Count) group(s), $($userEntries.Count) user entry/entries."
+        Write-Verbose "Team '$($t.name)': $($teamDirectKeys.Count) direct membership key(s), $($groupEntries.Count) group(s), $($userEntries.Count) user entry/entries."
+
+        if ($Diagnose) {
+            Write-Host "    [diagnose] team id $($t.id): $($teamDirectKeys.Count) direct key(s), $($groupEntries.Count) group(s), $($userEntries.Count) user(s) returned by members API" -ForegroundColor Magenta
+            $userEntries | Select-Object -First 5 | ForEach-Object {
+                $di = $_.Identity
+                Write-Host ("    [diagnose] user '{0}' id={1} unique={2} mail={3} account={4} descriptor={5} inTeamDirect={6}" -f `
+                    $_.Member.identity.displayName, $_.Member.identity.id, $_.Member.identity.uniqueName,
+                    (Get-AdoIdentityProperty $di 'Mail'), (Get-AdoIdentityProperty $di 'Account'),
+                    $di.descriptor, $teamDirectKeys.Contains([string]$_.Member.identity.id)) -ForegroundColor Magenta
+            }
+            $teamDirectKeys | Select-Object -First 5 | ForEach-Object { Write-Host "    [diagnose] direct key: $_" -ForegroundColor Magenta }
+        }
 
         foreach ($entry in $groupEntries) {
             $m    = $entry.Member
@@ -650,8 +687,14 @@ foreach ($p in $projList) {
             )
 
             # Prefer the team's own Direct membership; fall back to key matching only when unavailable.
-            $isDirect = if ($teamDirectIds.Count) {
-                $teamDirectIds.Contains([string]$id.id)
+            $isDirect = if ($teamDirectKeys.Count) {
+                $matched = $false
+                foreach ($k in @($id.id, $entry.Identity.descriptor, $id.uniqueName,
+                                 (Get-AdoIdentityProperty $entry.Identity 'Mail'),
+                                 (Get-AdoIdentityProperty $entry.Identity 'Account'))) {
+                    if ($k -and $teamDirectKeys.Contains([string]$k)) { $matched = $true; break }
+                }
+                $matched
             } else {
                 -not (Test-IdentityKey -Set $inheritedKeys -Values $candidateKeys)
             }
